@@ -3,6 +3,8 @@ const semver = require("semver");
 const { sleep, stringify } = require("../../../utils/general");
 const { Zetabyte } = require("../../../utils/zfs");
 const { Registry } = require("../../../utils/registry");
+const ReconnectingWebSocket = require("reconnecting-websocket");
+const WS = require("ws");
 
 // used for in-memory cache of the version info
 const FREENAS_SYSTEM_VERSION_CACHE_KEY = "freenas:system_version";
@@ -14,10 +16,133 @@ class Api {
     this.cache = cache;
     this.options = options;
     this.registry = new Registry();
+    this.ws = null;
+    this.wsCallbacks = new Map();
+    this.wsIdCounter = 1;
   }
 
   async getHttpClient() {
     return this.client;
+  }
+
+  /**
+   * Get or create WebSocket connection for JSON-RPC calls
+   * @returns {ReconnectingWebSocket}
+   */
+  async getWebSocketClient() {
+    if (this.ws && this.ws.readyState === WS.OPEN) {
+      return this.ws;
+    }
+
+    const httpClient = await this.getHttpClient();
+    const hostObj = new URL(httpClient.getBaseURL());
+
+    // Always use wss:// - TrueNAS will revoke API keys if insecure ws:// is used
+    const wsURL = `wss://${hostObj.host}/api/current`;
+    const timeout = 5000;
+
+    const wsOptions = {
+      WebSocket: WS,
+      connectionTimeout: timeout,
+      maxRetries: 3,
+    };
+
+    // Add authentication headers
+    if (httpClient.options.apiKey) {
+      wsOptions.headers = {
+        Authorization: `Bearer ${httpClient.options.apiKey}`,
+      };
+    }
+
+    this.ws = new ReconnectingWebSocket(wsURL, [], wsOptions);
+
+    // Set up message handler
+    this.ws.addEventListener("message", (event) => {
+      try {
+        const response = JSON.parse(event.data);
+        if (response.id && this.wsCallbacks.has(response.id)) {
+          const callback = this.wsCallbacks.get(response.id);
+          this.wsCallbacks.delete(response.id);
+
+          if (response.error) {
+            callback.reject(
+              new Error(
+                response.error.message || JSON.stringify(response.error),
+              ),
+            );
+          } else {
+            callback.resolve(response.result);
+          }
+        }
+      } catch (err) {
+        console.error("WebSocket message parse error:", err);
+      }
+    });
+
+    // Wait for connection to open
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("WebSocket connection timeout"));
+      }, timeout);
+
+      this.ws.addEventListener(
+        "open",
+        () => {
+          clearTimeout(timeout);
+          resolve();
+        },
+        { once: true },
+      );
+
+      this.ws.addEventListener(
+        "error",
+        (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        },
+        { once: true },
+      );
+    });
+
+    return this.ws;
+  }
+
+  /**
+   * Make a JSON-RPC call over WebSocket
+   * @param {string} method - The RPC method to call
+   * @param {Array} params - Parameters for the method
+   * @returns {Promise<any>} - The result from the RPC call
+   */
+  async jsonRpcCall(method, params = []) {
+    const ws = await this.getWebSocketClient();
+    const id = this.wsIdCounter++;
+
+    const request = {
+      jsonrpc: "2.0",
+      method: method,
+      params: params,
+      id: id,
+    };
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.wsCallbacks.delete(id);
+        reject(new Error(`JSON-RPC call timeout for method: ${method}`));
+      }, 30000);
+
+      this.wsCallbacks.set(id, {
+        resolve: (result) => {
+          clearTimeout(timeout);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+      });
+
+      ws.send(JSON.stringify(request));
+    });
   }
 
   /**
@@ -30,7 +155,7 @@ class Api {
         executor: {
           spawn: function () {
             throw new Error(
-              "cannot use the zb implementation to execute zfs commands, must use the http api"
+              "cannot use the zb implementation to execute zfs commands, must use the http api",
             );
           },
         },
@@ -103,7 +228,7 @@ class Api {
           "FreeNAS http error - code: " +
             response.statusCode +
             " body: " +
-            JSON.stringify(response.body)
+            JSON.stringify(response.body),
         );
       }
       page++;
@@ -203,46 +328,35 @@ class Api {
       return cacheData;
     }
 
-    const httpClient = await this.getHttpClient(false);
-    const endpoint = "/system/version/";
-    let response;
-    const startApiVersion = httpClient.getApiVersion();
     const versionInfo = {};
     const versionErrors = {};
-    const versionResponses = {};
 
-    httpClient.setApiVersion(2);
     /**
      * FreeNAS-11.2-U5
      * TrueNAS-12.0-RELEASE
      * TrueNAS-SCALE-20.11-MASTER-20201127-092915
+     *
+     * Use JSON-RPC over WebSocket to call system.version
      */
     try {
-      response = await httpClient.get(endpoint, null, { timeout: 5 * 1000 });
-      versionResponses.v2 = response;
-      if (response.statusCode == 200) {
-        versionInfo.v2 = response.body;
+      const result = await this.jsonRpcCall("system.version");
+      versionInfo.v2 = result;
 
-        // return immediately to save on resources and silly requests
-        await this.setVersionInfoCache(versionInfo);
+      // return immediately to save on resources and silly requests
+      await this.setVersionInfoCache(versionInfo);
 
-        // reset apiVersion
-        httpClient.setApiVersion(startApiVersion);
-
-        return versionInfo;
-      }
+      return versionInfo;
     } catch (e) {
       // if more info is needed use e.stack
       versionErrors.v2 = e.toString();
     }
 
-    // throw error if cannot get v1 or v2 data
+    // throw error if cannot get version data
     // likely bad creds/url
     throw new Error(
-      `FreeNAS error getting system version info: ${stringify({
+      `TrueNAS error getting system version info: ${stringify({
         errors: versionErrors,
-        responses: versionResponses,
-      })}`
+      })}`,
     );
   }
 
@@ -393,7 +507,7 @@ class Api {
     response = await httpClient.put(endpoint, {
       ...this.getSystemProperties(properties),
       user_properties_update: this.getPropertiesKeyValueArray(
-        this.getUserProperties(properties)
+        this.getUserProperties(properties),
       ),
     });
 
@@ -479,7 +593,7 @@ class Api {
           {
             "extra.snapshots": "true",
             "extra.retrieve_children": "false",
-          }
+          },
         );
 
         for (const snapshot of _.get(response, "snapshots", [])) {
@@ -530,7 +644,7 @@ class Api {
     response = await httpClient.put(endpoint, {
       //...this.getSystemProperties(properties),
       user_properties_update: this.getPropertiesKeyValueArray(
-        this.getUserProperties(properties)
+        this.getUserProperties(properties),
       ),
     });
 

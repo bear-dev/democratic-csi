@@ -20,7 +20,7 @@
 ######################
 # nodejs builder
 ######################
-FROM debian:12-slim AS build
+FROM debian:13-slim AS build
 #FROM --platform=$BUILDPLATFORM debian:10-slim AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -74,7 +74,7 @@ RUN rm -rf docker
 ######################
 # actual image
 ######################
-FROM debian:12-slim
+FROM debian:13-slim
 
 LABEL org.opencontainers.image.source https://github.com/democratic-csi/democratic-csi
 LABEL org.opencontainers.image.url https://github.com/democratic-csi/democratic-csi

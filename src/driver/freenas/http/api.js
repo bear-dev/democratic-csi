@@ -18,7 +18,7 @@ class Api {
     this.registry = new Registry();
     this.ws = null;
     this.wsCallbacks = new Map();
-    this.wsIdCounter = 1;
+    this.wsAuthenticated = false;
   }
 
   async getHttpClient() {
@@ -30,29 +30,24 @@ class Api {
    * @returns {ReconnectingWebSocket}
    */
   async getWebSocketClient() {
-    if (this.ws && this.ws.readyState === WS.OPEN) {
+    const httpClient = await this.getHttpClient();
+
+    if (this.ws && this.ws.readyState === WS.OPEN && this.wsAuthenticated) {
+      httpClient.logger.debug("TrueNAS WebSocket: Reusing existing connection");
       return this.ws;
     }
 
-    const httpClient = await this.getHttpClient();
-    const hostObj = new URL(httpClient.getBaseURL());
-
     // Always use wss:// - TrueNAS will revoke API keys if insecure ws:// is used
-    const wsURL = `wss://${hostObj.host}/api/current`;
-    const timeout = 5000;
+    const wsURL = `wss://${httpClient.options.host}/api/current`;
 
+    httpClient.logger.debug(`TrueNAS WebSocket: Connecting to ${wsURL}`);
+
+    const timeout = 5000;
     const wsOptions = {
       WebSocket: WS,
       connectionTimeout: timeout,
       maxRetries: 3,
     };
-
-    // Add authentication headers
-    if (httpClient.options.apiKey) {
-      wsOptions.headers = {
-        Authorization: `Bearer ${httpClient.options.apiKey}`,
-      };
-    }
 
     this.ws = new ReconnectingWebSocket(wsURL, [], wsOptions);
 
@@ -60,35 +55,59 @@ class Api {
     this.ws.addEventListener("message", (event) => {
       try {
         const response = JSON.parse(event.data);
+        httpClient.logger.debug(
+          `TrueNAS WebSocket: Received message for id=${response.id}`,
+        );
+
         if (response.id && this.wsCallbacks.has(response.id)) {
           const callback = this.wsCallbacks.get(response.id);
           this.wsCallbacks.delete(response.id);
 
           if (response.error) {
+            httpClient.logger.error(
+              `TrueNAS WebSocket: RPC error for id=${response.id}: ${JSON.stringify(response.error)}`,
+            );
             callback.reject(
               new Error(
                 response.error.message || JSON.stringify(response.error),
               ),
             );
           } else {
+            httpClient.logger.debug(
+              `TrueNAS WebSocket: RPC success for id=${response.id}`,
+            );
             callback.resolve(response.result);
           }
         }
       } catch (err) {
-        console.error("WebSocket message parse error:", err);
+        httpClient.logger.error(
+          `TrueNAS WebSocket: Message parse error: ${err.message}`,
+        );
       }
+    });
+
+    // Handle reconnection - need to re-authenticate
+    this.ws.addEventListener("open", () => {
+      this.wsAuthenticated = false;
+      httpClient.logger.debug(
+        "TrueNAS WebSocket: Connection opened, authentication required",
+      );
     });
 
     // Wait for connection to open
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const connectionTimer = setTimeout(() => {
+        httpClient.logger.error(
+          `TrueNAS WebSocket: Connection timeout after ${timeout}ms`,
+        );
         reject(new Error("WebSocket connection timeout"));
       }, timeout);
 
       this.ws.addEventListener(
         "open",
         () => {
-          clearTimeout(timeout);
+          clearTimeout(connectionTimer);
+          httpClient.logger.debug("TrueNAS WebSocket: Connected successfully");
           resolve();
         },
         { once: true },
@@ -97,12 +116,86 @@ class Api {
       this.ws.addEventListener(
         "error",
         (err) => {
-          clearTimeout(timeout);
+          clearTimeout(connectionTimer);
+          httpClient.logger.error(
+            `TrueNAS WebSocket: Connection error: ${stringify(err)}`,
+          );
           reject(err);
         },
         { once: true },
       );
     });
+
+    // Authenticate using JSON-RPC
+    if (httpClient.options.apiKey) {
+      httpClient.logger.debug(
+        "TrueNAS WebSocket: Authenticating with API key via JSON-RPC",
+      );
+
+      const authId = crypto.randomUUID();
+      const authRequest = {
+        jsonrpc: "2.0",
+        method: "auth.login_with_api_key",
+        params: [httpClient.options.apiKey],
+        id: authId,
+      };
+
+      // Send authentication request
+      const authResult = await new Promise((resolve, reject) => {
+        const authTimeout = setTimeout(() => {
+          this.wsCallbacks.delete(authId);
+          httpClient.logger.error(
+            "TrueNAS WebSocket: Authentication timeout after 10s",
+          );
+          reject(new Error("WebSocket authentication timeout"));
+        }, 10000);
+
+        this.wsCallbacks.set(authId, {
+          resolve: (result) => {
+            clearTimeout(authTimeout);
+            httpClient.logger.debug(
+              `TrueNAS WebSocket: Authentication successful: ${result}`,
+            );
+            resolve(result);
+          },
+          reject: (error) => {
+            clearTimeout(authTimeout);
+            httpClient.logger.error(
+              `TrueNAS WebSocket: Authentication failed: ${error.message}`,
+            );
+            reject(error);
+          },
+        });
+
+        try {
+          this.ws.send(JSON.stringify(authRequest));
+          httpClient.logger.debug(
+            `TrueNAS WebSocket: Authentication request sent (id=${authId})`,
+          );
+        } catch (err) {
+          clearTimeout(authTimeout);
+          this.wsCallbacks.delete(authId);
+          httpClient.logger.error(
+            `TrueNAS WebSocket: Failed to send authentication request: ${err.message}`,
+          );
+          reject(err);
+        }
+      });
+
+      if (authResult === true) {
+        this.wsAuthenticated = true;
+        httpClient.logger.debug(
+          "TrueNAS WebSocket: Authentication completed successfully",
+        );
+      } else {
+        throw new Error(
+          `WebSocket authentication failed with unexpected result: ${authResult}`,
+        );
+      }
+    } else {
+      // No API key configured
+      throw new Error(`TrueNAS WebSocket: No API key configured`);
+    }
 
     return this.ws;
   }
@@ -114,8 +207,13 @@ class Api {
    * @returns {Promise<any>} - The result from the RPC call
    */
   async jsonRpcCall(method, params = []) {
+    const httpClient = await this.getHttpClient();
+    httpClient.logger.debug(
+      `TrueNAS JSON-RPC: Calling method=${method} with params=${JSON.stringify(params)}`,
+    );
+
     const ws = await this.getWebSocketClient();
-    const id = this.wsIdCounter++;
+    const id = crypto.randomUUID();
 
     const request = {
       jsonrpc: "2.0",
@@ -124,24 +222,49 @@ class Api {
       id: id,
     };
 
+    httpClient.logger.debug(
+      `TrueNAS JSON-RPC: Sending request id=${id}: ${JSON.stringify(request)}`,
+    );
+
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const rpcTimeout = setTimeout(() => {
         this.wsCallbacks.delete(id);
+        httpClient.logger.error(
+          `TrueNAS JSON-RPC: Timeout for method=${method} id=${id} after 30s`,
+        );
         reject(new Error(`JSON-RPC call timeout for method: ${method}`));
       }, 30000);
 
       this.wsCallbacks.set(id, {
         resolve: (result) => {
-          clearTimeout(timeout);
+          clearTimeout(rpcTimeout);
+          httpClient.logger.debug(
+            `TrueNAS JSON-RPC: Method=${method} id=${id} resolved successfully`,
+          );
           resolve(result);
         },
         reject: (error) => {
-          clearTimeout(timeout);
+          clearTimeout(rpcTimeout);
+          httpClient.logger.error(
+            `TrueNAS JSON-RPC: Method=${method} id=${id} rejected: ${error.message}`,
+          );
           reject(error);
         },
       });
 
-      ws.send(JSON.stringify(request));
+      try {
+        ws.send(JSON.stringify(request));
+        httpClient.logger.debug(
+          `TrueNAS JSON-RPC: Request id=${id} sent successfully`,
+        );
+      } catch (err) {
+        clearTimeout(rpcTimeout);
+        this.wsCallbacks.delete(id);
+        httpClient.logger.error(
+          `TrueNAS JSON-RPC: Failed to send request id=${id}: ${err.message}`,
+        );
+        reject(err);
+      }
     });
   }
 
@@ -175,7 +298,7 @@ class Api {
     const httpClient = await this.getHttpClient();
     let target;
     let page = 0;
-    let lastReponse;
+    let lastResponse;
 
     // loop and find target
     let queryParams = {};
@@ -196,7 +319,7 @@ class Api {
           break;
         }
       }
-      lastReponse = response;
+      lastResponse = response;
 
       if (response.statusCode == 200) {
         if (response.body.length < 1) {
@@ -306,6 +429,9 @@ class Api {
 
   async getSystemVersionMajor() {
     const majorMinor = await this.getSystemVersionMajorMinor();
+    if (!majorMinor) {
+      return null;
+    }
     return majorMinor.split(".")[0];
   }
 
@@ -322,11 +448,19 @@ class Api {
   }
 
   async getSystemVersion() {
+    const httpClient = await this.getHttpClient();
     let cacheData = await this.cache.get(FREENAS_SYSTEM_VERSION_CACHE_KEY);
 
     if (cacheData) {
+      httpClient.logger.debug(
+        "TrueNAS getSystemVersion: Using cached version data",
+      );
       return cacheData;
     }
+
+    httpClient.logger.debug(
+      "TrueNAS getSystemVersion: Cache miss, fetching version via JSON-RPC",
+    );
 
     const versionInfo = {};
     const versionErrors = {};
@@ -340,24 +474,32 @@ class Api {
      */
     try {
       const result = await this.jsonRpcCall("system.version");
+      httpClient.logger.info(
+        `TrueNAS getSystemVersion: Got version: ${result}`,
+      );
       versionInfo.v2 = result;
 
       // return immediately to save on resources and silly requests
       await this.setVersionInfoCache(versionInfo);
+      httpClient.logger.debug("TrueNAS getSystemVersion: Cached version info");
 
       return versionInfo;
     } catch (e) {
       // if more info is needed use e.stack
       versionErrors.v2 = e.toString();
+      httpClient.logger.error(
+        `TrueNAS getSystemVersion: Error - ${e.toString()}`,
+      );
+      httpClient.logger.error(`TrueNAS getSystemVersion: Stack - ${e.stack}`);
     }
 
     // throw error if cannot get version data
     // likely bad creds/url
-    throw new Error(
-      `TrueNAS error getting system version info: ${stringify({
-        errors: versionErrors,
-      })}`,
-    );
+    const errorMsg = `TrueNAS error getting system version info: ${stringify({
+      errors: versionErrors,
+    })}`;
+    httpClient.logger.error(`TrueNAS getSystemVersion: ${errorMsg}`);
+    throw new Error(errorMsg);
   }
 
   getIsUserProperty(property) {
@@ -727,7 +869,6 @@ class Api {
 
   async SnapshotDelete(snapshotName, data = {}) {
     const httpClient = await this.getHttpClient(false);
-    const zb = await this.getZetabyte();
     const systemVersionSemver = await this.getSystemVersionSemver();
 
     let response;

@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y locales && rm -rf /var/lib/apt/lists/* 
   && localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
 
 ENV LANG=en_US.utf8
-ENV NODE_VERSION=v20.19.0
+ENV NODE_VERSION=v24.15.0
 ENV NODE_ENV=production
 
 # install build deps
@@ -121,7 +121,7 @@ RUN \
   echo '83e7a026-2564-455b-ada6-ddbdaf0bc519' > /etc/nvme/hostid && \
   echo 'nqn.2014-08.org.nvmexpress:uuid:941e4f03-2cd6-435e-86df-731b1c573d86' > /etc/nvme/hostnqn
 
-ARG RCLONE_VERSION=1.71.2
+ARG RCLONE_VERSION=1.74.0
 ADD docker/rclone-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/rclone-installer.sh && rclone-installer.sh
 
@@ -129,15 +129,15 @@ ARG RESTIC_VERSION=0.18.1
 ADD docker/restic-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/restic-installer.sh && restic-installer.sh
 
-ARG KOPIA_VERSION=0.21.1
+ARG KOPIA_VERSION=0.22.3
 ADD docker/kopia-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/kopia-installer.sh && kopia-installer.sh
 
-ARG YQ_VERSION=v4.48.1
+ARG YQ_VERSION=v4.53.2
 ADD docker/yq-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/yq-installer.sh && yq-installer.sh
 
-ARG CTR_VERSION=v2.0.4
+ARG CTR_VERSION=v2.3.0
 ADD docker/ctr-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/ctr-installer.sh && ctr-installer.sh
 
@@ -147,7 +147,7 @@ RUN chmod +x /usr/local/sbin/ctr-installer.sh && ctr-installer.sh
 #        rm -rf /var/lib/apt/lists/*
 
 # install objectivefs
-ARG OBJECTIVEFS_VERSION=7.3
+ARG OBJECTIVEFS_VERSION=7.4
 ADD docker/objectivefs-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/objectivefs-installer.sh && objectivefs-installer.sh
 

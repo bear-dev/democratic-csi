@@ -46,7 +46,7 @@ class Api {
     const wsOptions = {
       WebSocket: WS,
       connectionTimeout: timeout,
-      maxRetries: 3,
+      maxRetries: 12,
     };
 
     this.ws = new ReconnectingWebSocket(wsURL, [], wsOptions);

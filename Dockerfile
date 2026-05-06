@@ -20,8 +20,7 @@
 ######################
 # nodejs builder
 ######################
-FROM debian:13-slim AS build
-#FROM --platform=$BUILDPLATFORM debian:10-slim AS build
+FROM --platform=$BUILDPLATFORM debian:13-slim AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -38,7 +37,7 @@ ENV NODE_VERSION=v24.15.0
 ENV NODE_ENV=production
 
 # install build deps
-# RUN apt-get update && apt-get install -y python3 make cmake gcc g++
+RUN apt-get update && apt-get install -y python3 make cmake gcc g++
 
 # install node
 RUN apt-get update && apt-get install -y wget xz-utils
@@ -76,9 +75,9 @@ RUN rm -rf docker
 ######################
 FROM debian:13-slim
 
-LABEL org.opencontainers.image.source https://github.com/democratic-csi/democratic-csi
-LABEL org.opencontainers.image.url https://github.com/democratic-csi/democratic-csi
-LABEL org.opencontainers.image.licenses MIT
+LABEL org.opencontainers.image.source=https://github.com/democratic-csi/democratic-csi
+LABEL org.opencontainers.image.url=https://github.com/democratic-csi/democratic-csi
+LABEL org.opencontainers.image.licenses=MIT
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEMOCRATIC_CSI_IS_CONTAINER=true
@@ -137,7 +136,7 @@ ARG YQ_VERSION=v4.53.2
 ADD docker/yq-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/yq-installer.sh && yq-installer.sh
 
-ARG CTR_VERSION=v2.3.0
+ARG CTR_VERSION=v2.0.4
 ADD docker/ctr-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/ctr-installer.sh && ctr-installer.sh
 

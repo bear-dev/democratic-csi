@@ -19,6 +19,7 @@ class Api {
     this.ws = null;
     this.wsCallbacks = new Map();
     this.wsAuthenticated = false;
+    this.wsConnecting = null; // Promise to prevent concurrent connection attempts
   }
 
   async getHttpClient() {
@@ -26,27 +27,98 @@ class Api {
   }
 
   /**
-   * Get or create WebSocket connection for JSON-RPC calls
+   * Check if WebSocket is in a usable state
+   * @returns {boolean}
+   */
+  isWebSocketReady() {
+    // WebSocket.OPEN = 1 (standard WebSocket readyState)
+    return this.ws && this.ws.readyState === 1 && this.wsAuthenticated;
+  }
+
+  /**
+   * Close existing WebSocket connection and clean up
+   */
+  closeWebSocket() {
+    if (this.ws) {
+      try {
+        // Disable reconnection before closing
+        this.ws.close();
+      } catch (err) {
+        // Ignore close errors
+      }
+      this.ws = null;
+    }
+    this.wsAuthenticated = false;
+    this.wsConnecting = null;
+    // Reject any pending callbacks
+    for (const [id, callback] of this.wsCallbacks) {
+      callback.reject(new Error("WebSocket connection closed"));
+    }
+    this.wsCallbacks.clear();
+  }
+
+  /**
+   * Get or create WebSocket connection for JSON-RPC calls.
+   * Uses connection pooling - maintains a single persistent connection.
    * @returns {ReconnectingWebSocket}
    */
   async getWebSocketClient() {
     const httpClient = await this.getHttpClient();
 
-    if (this.ws && this.ws.readyState === WS.OPEN && this.wsAuthenticated) {
+    // If we have a ready connection, reuse it
+    if (this.isWebSocketReady()) {
       httpClient.logger.debug("TrueNAS WebSocket: Reusing existing connection");
       return this.ws;
     }
 
-    // Always use wss:// - TrueNAS will revoke API keys if insecure ws:// is used
-    const wsURL = `wss://${httpClient.options.host}/api/current`;
+    // If connection is in progress, wait for it
+    if (this.wsConnecting) {
+      httpClient.logger.debug(
+        "TrueNAS WebSocket: Connection in progress, waiting...",
+      );
+      return this.wsConnecting;
+    }
 
+    // Start new connection - store promise to prevent concurrent attempts
+    this.wsConnecting = this._createWebSocketConnection(httpClient);
+
+    try {
+      const ws = await this.wsConnecting;
+      return ws;
+    } catch (err) {
+      // Clean up on failure
+      this.closeWebSocket();
+      throw err;
+    }
+  }
+
+  /**
+   * Internal method to create and authenticate WebSocket connection
+   * @private
+   */
+  async _createWebSocketConnection(httpClient) {
+    // Close any existing connection first
+    if (this.ws) {
+      httpClient.logger.debug(
+        "TrueNAS WebSocket: Closing existing connection before reconnecting",
+      );
+      try {
+        this.ws.close();
+      } catch (err) {
+        // Ignore
+      }
+      this.ws = null;
+      this.wsAuthenticated = false;
+    }
+
+    const wsURL = `wss://${httpClient.options.host}/api/current`;
     httpClient.logger.debug(`TrueNAS WebSocket: Connecting to ${wsURL}`);
 
     const timeout = 5000;
     const wsOptions = {
       WebSocket: WS,
       connectionTimeout: timeout,
-      maxRetries: 12,
+      maxRetries: 0, // Disable auto-reconnect - we manage reconnection ourselves
     };
 
     this.ws = new ReconnectingWebSocket(wsURL, [], wsOptions);
@@ -86,12 +158,20 @@ class Api {
       }
     });
 
-    // Handle reconnection - need to re-authenticate
-    this.ws.addEventListener("open", () => {
+    // Handle connection close - mark as not authenticated
+    this.ws.addEventListener("close", () => {
+      httpClient.logger.debug("TrueNAS WebSocket: Connection closed");
       this.wsAuthenticated = false;
-      httpClient.logger.debug(
-        "TrueNAS WebSocket: Connection opened, authentication required",
+      this.wsConnecting = null;
+    });
+
+    // Handle errors
+    this.ws.addEventListener("error", (err) => {
+      httpClient.logger.error(
+        `TrueNAS WebSocket: Connection error: ${stringify(err)}`,
       );
+      this.wsAuthenticated = false;
+      this.wsConnecting = null;
     });
 
     // Wait for connection to open
@@ -127,145 +207,176 @@ class Api {
     });
 
     // Authenticate using JSON-RPC
-    if (httpClient.options.apiKey) {
-      httpClient.logger.debug(
-        "TrueNAS WebSocket: Authenticating with API key via JSON-RPC",
-      );
-
-      const authId = crypto.randomUUID();
-      const authRequest = {
-        jsonrpc: "2.0",
-        method: "auth.login_with_api_key",
-        params: [httpClient.options.apiKey],
-        id: authId,
-      };
-
-      // Send authentication request
-      const authResult = await new Promise((resolve, reject) => {
-        const authTimeout = setTimeout(() => {
-          this.wsCallbacks.delete(authId);
-          httpClient.logger.error(
-            "TrueNAS WebSocket: Authentication timeout after 10s",
-          );
-          reject(new Error("WebSocket authentication timeout"));
-        }, 10000);
-
-        this.wsCallbacks.set(authId, {
-          resolve: (result) => {
-            clearTimeout(authTimeout);
-            httpClient.logger.debug(
-              `TrueNAS WebSocket: Authentication successful: ${result}`,
-            );
-            resolve(result);
-          },
-          reject: (error) => {
-            clearTimeout(authTimeout);
-            httpClient.logger.error(
-              `TrueNAS WebSocket: Authentication failed: ${error.message}`,
-            );
-            reject(error);
-          },
-        });
-
-        try {
-          this.ws.send(JSON.stringify(authRequest));
-          httpClient.logger.debug(
-            `TrueNAS WebSocket: Authentication request sent (id=${authId})`,
-          );
-        } catch (err) {
-          clearTimeout(authTimeout);
-          this.wsCallbacks.delete(authId);
-          httpClient.logger.error(
-            `TrueNAS WebSocket: Failed to send authentication request: ${err.message}`,
-          );
-          reject(err);
-        }
-      });
-
-      if (authResult === true) {
-        this.wsAuthenticated = true;
-        httpClient.logger.debug(
-          "TrueNAS WebSocket: Authentication completed successfully",
-        );
-      } else {
-        throw new Error(
-          `WebSocket authentication failed with unexpected result: ${authResult}`,
-        );
-      }
-    } else {
-      // No API key configured
+    if (!httpClient.options.apiKey) {
       throw new Error(`TrueNAS WebSocket: No API key configured`);
     }
 
-    return this.ws;
-  }
-
-  /**
-   * Make a JSON-RPC call over WebSocket
-   * @param {string} method - The RPC method to call
-   * @param {Array} params - Parameters for the method
-   * @returns {Promise<any>} - The result from the RPC call
-   */
-  async jsonRpcCall(method, params = []) {
-    const httpClient = await this.getHttpClient();
     httpClient.logger.debug(
-      `TrueNAS JSON-RPC: Calling method=${method} with params=${JSON.stringify(params)}`,
+      "TrueNAS WebSocket: Authenticating with API key via JSON-RPC",
     );
 
-    const ws = await this.getWebSocketClient();
-    const id = crypto.randomUUID();
-
-    const request = {
+    const authId = crypto.randomUUID();
+    const authRequest = {
       jsonrpc: "2.0",
-      method: method,
-      params: params,
-      id: id,
+      method: "auth.login_with_api_key",
+      params: [httpClient.options.apiKey],
+      id: authId,
     };
 
-    httpClient.logger.debug(
-      `TrueNAS JSON-RPC: Sending request id=${id}: ${JSON.stringify(request)}`,
-    );
-
-    return new Promise((resolve, reject) => {
-      const rpcTimeout = setTimeout(() => {
-        this.wsCallbacks.delete(id);
+    // Send authentication request
+    const authResult = await new Promise((resolve, reject) => {
+      const authTimeout = setTimeout(() => {
+        this.wsCallbacks.delete(authId);
         httpClient.logger.error(
-          `TrueNAS JSON-RPC: Timeout for method=${method} id=${id} after 30s`,
+          "TrueNAS WebSocket: Authentication timeout after 10s",
         );
-        reject(new Error(`JSON-RPC call timeout for method: ${method}`));
-      }, 30000);
+        reject(new Error("WebSocket authentication timeout"));
+      }, 10000);
 
-      this.wsCallbacks.set(id, {
+      this.wsCallbacks.set(authId, {
         resolve: (result) => {
-          clearTimeout(rpcTimeout);
+          clearTimeout(authTimeout);
           httpClient.logger.debug(
-            `TrueNAS JSON-RPC: Method=${method} id=${id} resolved successfully`,
+            `TrueNAS WebSocket: Authentication successful: ${result}`,
           );
           resolve(result);
         },
         reject: (error) => {
-          clearTimeout(rpcTimeout);
+          clearTimeout(authTimeout);
           httpClient.logger.error(
-            `TrueNAS JSON-RPC: Method=${method} id=${id} rejected: ${error.message}`,
+            `TrueNAS WebSocket: Authentication failed: ${error.message}`,
           );
           reject(error);
         },
       });
 
       try {
-        ws.send(JSON.stringify(request));
+        this.ws.send(JSON.stringify(authRequest));
         httpClient.logger.debug(
-          `TrueNAS JSON-RPC: Request id=${id} sent successfully`,
+          `TrueNAS WebSocket: Authentication request sent (id=${authId})`,
         );
       } catch (err) {
-        clearTimeout(rpcTimeout);
-        this.wsCallbacks.delete(id);
+        clearTimeout(authTimeout);
+        this.wsCallbacks.delete(authId);
         httpClient.logger.error(
-          `TrueNAS JSON-RPC: Failed to send request id=${id}: ${err.message}`,
+          `TrueNAS WebSocket: Failed to send authentication request: ${err.message}`,
         );
         reject(err);
       }
     });
+
+    if (authResult === true) {
+      this.wsAuthenticated = true;
+      this.wsConnecting = null; // Clear connecting promise on success
+      httpClient.logger.info(
+        "TrueNAS WebSocket: Authentication completed successfully",
+      );
+    } else {
+      throw new Error(
+        `WebSocket authentication failed with unexpected result: ${authResult}`,
+      );
+    }
+
+    return this.ws;
+  }
+
+  /**
+   * Make a JSON-RPC call over WebSocket with automatic retry on connection failure
+   * @param {string} method - The RPC method to call
+   * @param {Array} params - Parameters for the method
+   * @param {number} retries - Number of retries on connection failure (default: 1)
+   * @returns {Promise<any>} - The result from the RPC call
+   */
+  async jsonRpcCall(method, params = [], retries = 1) {
+    const httpClient = await this.getHttpClient();
+    httpClient.logger.debug(
+      `TrueNAS JSON-RPC: Calling method=${method} with params=${JSON.stringify(params)}`,
+    );
+
+    let lastError;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        // On retry, force reconnection by closing the existing connection
+        if (attempt > 0) {
+          httpClient.logger.debug(
+            `TrueNAS JSON-RPC: Retry attempt ${attempt} for method=${method}`,
+          );
+          this.closeWebSocket();
+        }
+
+        const ws = await this.getWebSocketClient();
+        const id = crypto.randomUUID();
+
+        const request = {
+          jsonrpc: "2.0",
+          method: method,
+          params: params,
+          id: id,
+        };
+
+        httpClient.logger.debug(
+          `TrueNAS JSON-RPC: Sending request id=${id}: ${JSON.stringify(request)}`,
+        );
+
+        const result = await new Promise((resolve, reject) => {
+          const rpcTimeout = setTimeout(() => {
+            this.wsCallbacks.delete(id);
+            httpClient.logger.error(
+              `TrueNAS JSON-RPC: Timeout for method=${method} id=${id} after 30s`,
+            );
+            reject(new Error(`JSON-RPC call timeout for method: ${method}`));
+          }, 30000);
+
+          this.wsCallbacks.set(id, {
+            resolve: (result) => {
+              clearTimeout(rpcTimeout);
+              httpClient.logger.debug(
+                `TrueNAS JSON-RPC: Method=${method} id=${id} resolved successfully`,
+              );
+              resolve(result);
+            },
+            reject: (error) => {
+              clearTimeout(rpcTimeout);
+              httpClient.logger.error(
+                `TrueNAS JSON-RPC: Method=${method} id=${id} rejected: ${error.message}`,
+              );
+              reject(error);
+            },
+          });
+
+          try {
+            ws.send(JSON.stringify(request));
+            httpClient.logger.debug(
+              `TrueNAS JSON-RPC: Request id=${id} sent successfully`,
+            );
+          } catch (err) {
+            clearTimeout(rpcTimeout);
+            this.wsCallbacks.delete(id);
+            httpClient.logger.error(
+              `TrueNAS JSON-RPC: Failed to send request id=${id}: ${err.message}`,
+            );
+            reject(err);
+          }
+        });
+
+        return result;
+      } catch (err) {
+        lastError = err;
+        httpClient.logger.error(
+          `TrueNAS JSON-RPC: Attempt ${attempt + 1} failed for method=${method}: ${err.message}`,
+        );
+
+        // Don't retry on certain errors
+        if (
+          err.message.includes("No API key configured") ||
+          err.message.includes("Authentication failed")
+        ) {
+          throw err;
+        }
+      }
+    }
+
+    throw lastError;
   }
 
   /**
